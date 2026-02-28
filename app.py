@@ -4,17 +4,20 @@ from typing import Optional, Tuple, Union
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, Response
 from flask.typing import ResponseReturnValue
 import firebase_admin
+from firebase_admin import auth
 from firebase_admin import credentials, firestore
 from firebase_admin.firestore import DocumentReference
+from functools import wraps
 import os
+import requests
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
-
+WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY")
 # A dummy user for the login. 
 dummy_user = {
     "username": "student",
-    "password": "secret"
+    "password": "password"
 }
 
 # Initialize Firestore
@@ -35,13 +38,54 @@ def get_current_user():
     return session.get("username")
 
 
-def get_user_or_401():
-    """Return the current API user or an Unauthorized response."""
-    current_user = get_current_user()
-    if not current_user:
-        return jsonify({"error": "Unauthorized"}), 401
-    return current_user
 
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # 1. Grab the expected key from the environment
+        expected_key = os.environ.get("SENSOR_API_KEY")
+
+        # 2. Grab the provided key from the request headers
+        # TODO: Get "X-API-Key" from request.headers
+        provided_key = request.headers.get("X-API-Key")
+
+        # TODO: If they don't match, return jsonify({"error": "Unauthorized"}), 401
+        # 3. Compare them
+        if not expected_key or provided_key != expected_key:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        # 4. If they match, allow the route to execute normally
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+@app.route("/api/sensor_data", methods=["POST"])
+@require_api_key
+def sensor_data():
+    return jsonify({"message": "Sensor data accepted"}),200
+
+
+def get_user_or_401():
+    # 1. Extract the token from the Authorization header
+    header = request.headers.get("Authorization")
+
+    # Expect format: "Bearer <JWT>"
+    if not header or not header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+
+    # Remove "Bearer " to get the raw token
+    token = header.split(" ")[1]
+
+    try:
+        # 2. Verify the token signature and validity using Firebase Admin SDK
+        decoded = auth.verify_id_token(token)
+
+        # 3. Extract the UID to identify who made the request
+        return decoded["uid"]
+
+    except Exception:
+        # Token is expired, invalid, or tampered with
+        return jsonify({"error": "Unauthorized"}), 401
 
 def get_profile_doc_ref(username: str):
     """Get the Firestore document reference for a user's profile."""
@@ -75,7 +119,6 @@ def require_json_content_type():
     if not request.is_json:
         return jsonify({"error": "Content-Type must be application/json"}), 415
     return None
-
 
 def set_profile(username: str, profile_data: dict[str, str], *, merge: bool):
     """Persist profile data to Firestore.
@@ -115,6 +158,38 @@ def login():
     return render_template("login.html", error="Invalid credentials. Try again.")
 
 
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if request.method == "GET":
+        return render_template("signup.html")
+
+    email = request.form.get("email")
+    password = request.form.get("password")
+    confirm_password = request.form.get("confirm_password")
+
+    # Validate passwords match
+    if password != confirm_password:
+        return render_template("signup.html", error="Passwords do not match")
+
+    # TODO: Create user with Firebase Admin SDK
+    try:
+        user = auth.create_user(email=email, password=password)
+    # TODO: Initialize profile in Firestore
+
+        db.collection("profiles").document(user.uid).set({
+            "email": email,
+            "role": "user",
+            "created_at": firestore.SERVER_TIMESTAMP
+        })
+
+    except Exception as e:
+        return render_template("signup.html", error=str(e))
+
+
+    # TODO: Redirect to login on success    
+    return redirect(url_for("login"))
+
+
 @app.route("/logout")
 def logout():
     """Clear the session and return to login."""
@@ -148,6 +223,21 @@ def profile():
 
 
 # --- API Routes ---
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.json
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={WEB_API_KEY}"
+    payload = {"email": data["email"], "password": data["password"], "returnSecureToken": True}
+
+    res = requests.post(url, json=payload)
+
+    print("Login route hit")
+    print("Request JSON:", request.json)
+
+    if res.status_code == 200:
+        return jsonify({"token": res.json()["idToken"]}), 200
+    return jsonify({"error": "Invalid credentials"}), 401
+
 
 @app.get("/api/profile")
 def api_get_profile():
@@ -203,9 +293,43 @@ def api_update_profile():
     if not data:
         return jsonify({"error": "Request body cannot be empty"}), 400
 
+    errors = []
+    #Whitelist check
+    allowed_fields = {"first_name", "last_name", "student_id"}
+
+    for field in data.keys():
+        if field not in allowed_fields:
+            errors.append(f"Field '{field}' is not allowed.")
+
+    #Bounds checking
     first_name = data.get("first_name")
     last_name = data.get("last_name")
     student_id = data.get("student_id")
+
+    if first_name is not None:
+            if not isinstance(first_name, str):
+                errors.append("first_name must be a string.")
+            elif len(first_name.strip()) > 50:
+                errors.append("first_name must not exceed 50 characters.")
+
+    if last_name is not None:
+        if not isinstance(last_name, str):
+            errors.append("last_name must be a string.")
+        elif len(last_name.strip()) > 50:
+            errors.append("last_name must not exceed 50 characters.")
+
+    if student_id is not None:
+        student_id_str = str(student_id).strip()
+        if not student_id_str.isalnum():
+            errors.append("student_id must be alphanumeric.")
+        elif len(student_id_str) not in (8, 9):
+            errors.append("student_id must be exactly 8 or 9 characters.")
+
+    #Return all errors
+    if errors:
+        return jsonify({"error": "Validation failed", "details": errors}), 400
+
+    #safe update
 
     # Prepare the update data (only include provided fields)
     update_data = {}
